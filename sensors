@@ -1,0 +1,178 @@
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <algorithm>
+#include "DHT.h"
+
+const char* ssid        = "Chipri";
+const char* password    = "CPRmatei";
+const char* mqtt_server = "10.156.233.171";
+const char* token_sens  = "u3ltANv8PSnTsXjwzFHA";
+const char* token_ws    = "u790f8TWPXKj8I0hhU1l";
+
+#define DHTPIN 32
+#define DHTTYPE DHT11
+#define MEASURE_MS   5000UL
+#define NO_BEAT_MS   3000UL
+#define MAX_SAMPLES    60
+#define MAX_TEMP_SMPL  10
+
+enum State { STANDBY, COUNTDOWN, SENDING };
+State state = STANDBY;
+
+uint32_t countdownStart   = 0;
+uint32_t lastBeatTime      = 0;
+uint32_t lastStandbyPrint = 0;
+int      lastTickSec      = 99;
+
+float   bpmSamples[MAX_SAMPLES];
+float   spo2Samples[MAX_SAMPLES];
+float   tempSamples[MAX_TEMP_SMPL];
+uint8_t sampleCount     = 0;
+uint8_t tempSampleCount = 0;
+
+WiFiClient   espClient;
+PubSubClient client(espClient);
+PulseOximeter pox;
+DHT dht(DHTPIN, DHTTYPE);
+
+float average(float* arr, uint8_t n) {
+  if (n == 0) return 0.0f;
+  float s = 0;
+  for (uint8_t i = 0; i < n; i++) s += arr[i];
+  return s / n;
+}
+
+bool connectMQTT(const char* clientID, const char* authToken) {
+  Serial.printf("[MQTT] Conectare cu ID: %s...", clientID);
+  int retry = 0;
+  while (!client.connected() && retry < 5) {
+    if (client.connect(clientID, authToken, "")) {
+      Serial.println(" OK");
+      return true;
+    } else {
+      Serial.print(".");
+      delay(1000);
+      retry++;
+    }
+  }
+  Serial.printf(" FAILED (rc=%d)\n", client.state());
+  return false;
+}
+
+void setupWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("[WiFi] Conectare...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 25) {
+    delay(500); 
+    Serial.print("."); 
+    retry++;
+  }
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println(" OK");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(" TIMEOUT");
+  }
+}
+
+void onBeatDetected() {
+  float bpm  = pox.getHeartRate();
+  float spo2 = pox.getSpO2();
+  if (bpm <= 40.0f || bpm >= 200.0f || spo2 < 70.0f) return;
+  lastBeatTime = millis();
+  if (state == STANDBY) {
+    state          = COUNTDOWN;
+    countdownStart = millis();
+    sampleCount     = 0;
+    tempSampleCount = 0;
+    lastTickSec     = 99;
+    Serial.println("\n[!] Deget detectat! Mentineti apasat...");
+  }
+  if (state == COUNTDOWN && sampleCount < MAX_SAMPLES) {
+    bpmSamples[sampleCount]  = bpm;
+    spo2Samples[sampleCount] = spo2;
+    sampleCount++;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  dht.begin();
+  if (!pox.begin()) {
+    Serial.println("CRITICAL: MAX30100 nu a fost gasit!");
+    while(1);
+  }
+  pox.setIRLedCurrent(MAX30100_LED_CURR_50MA);
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+  client.setServer(mqtt_server, 1883);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("\n>> Sistem pregatit. Pune degetul pe senzor...");
+}
+
+void loop() {
+  pox.update();
+  uint32_t now = millis();
+  if (state == STANDBY) {
+    if (now - lastStandbyPrint > 5000) {
+      Serial.println("[STANDBY] Astept masuratoare...");
+      lastStandbyPrint = now;
+    }
+  }
+  else if (state == COUNTDOWN) {
+    uint32_t elapsed = now - countdownStart;
+    int secsLeft = (int)((MEASURE_MS - elapsed) / 1000);
+    if (now - lastBeatTime > NO_BEAT_MS) {
+      Serial.println("\n[!] Eroare: Deget ridicat prematur.");
+      state = STANDBY;
+      return;
+    }
+    if (secsLeft != lastTickSec) {
+      lastTickSec = secsLeft;
+      float tempC = dht.readTemperature();
+      if (!isnan(tempC) && tempSampleCount < MAX_TEMP_SMPL) {
+          tempSamples[tempSampleCount++] = tempC;
+      }
+      Serial.printf("Masurare: %d s ramase...\n", secsLeft + 1);
+    }
+    if (elapsed >= MEASURE_MS) state = SENDING;
+  }
+  else if (state == SENDING) {
+    float f_bpm  = average(bpmSamples,  sampleCount);
+    float f_spo2 = average(spo2Samples, sampleCount);
+    float f_temp = average(tempSamples, tempSampleCount);
+    Serial.println("\n--- REZULTATE FINALE ---");
+    Serial.printf("BPM: %.1f | SpO2: %.1f%% | Temp: %.1f C\n", f_bpm, f_spo2, f_temp);
+    pox.shutdown();
+    setupWiFi();
+    if (WiFi.status() == WL_CONNECTED) {
+      char payload[128];
+      snprintf(payload, sizeof(payload), "{\"pulse\":%.1f,\"oxygen\":%.1f,\"temperature\":%.1f}", f_bpm, f_spo2, f_temp);
+      if (connectMQTT("ESP32_Pulse_Main", token_sens)) {
+        client.publish("v1/devices/me/telemetry", payload);
+        delay(200);
+        client.disconnect();
+      }
+      if (connectMQTT("ESP32_Pulse_WS", token_ws)) {
+        client.publish("v1/devices/me/attributes", payload);
+        delay(200);
+        client.disconnect();
+      }
+    }
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[Retea] Deconectat pentru economisire.");
+    if (pox.begin()) {
+        pox.setIRLedCurrent(MAX30100_LED_CURR_50MA);
+        pox.setOnBeatDetectedCallback(onBeatDetected);
+    }
+    state = STANDBY;
+    Serial.println("Gata pentru o noua citire.");
+  }
+}
