@@ -1,0 +1,319 @@
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
+#include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+const char* ssid        = "Chipri";
+const char* password    = "CPRmatei";
+const char* mqtt_server = "10.156.233.171";
+const char* token       = "u790f8TWPXKj8I0hhU1l";
+
+WiFiClient   espClient;
+PubSubClient client(espClient);
+
+#define SCR_W 800
+#define SCR_H 480
+#define BTN_Y 360
+#define BTN_H 80
+#define BTN_GAP 40
+#define BTN_COUNT 4
+#define PIN_BUTON_PANICA 43
+
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastPollTime = 0;
+int requestId = 0; 
+int activeBtn = -1;
+bool touching = false;
+unsigned long btnPressStartTime = 0;
+int currentlyPressedBtn = -1;
+bool inEasterEgg = false;
+bool waitForRelease = false; 
+bool dateSensibileVizibile = true;
+
+float lastPulse = 0, lastSpO2 = 0, lastTemp = 0;
+String msgDeLaPi = "ready"; 
+String lastReceivedPiMsg = "ready"; 
+
+const char* BTN_LABELS[BTN_COUNT] = { "Urgenta", "Check-Up", "Febra", "Dureri" };
+const char* BTN_MESSAGES[BTN_COUNT] = {
+  "SOS: Se apeleaza cadrul medical de garda...",
+  "Asezati degetul pe senzor pentru masurare",
+  "Febra detectata: Se dispenseaza Paracetamol",
+  "Recomandam consultarea unui specialist"
+};
+
+class LGFX : public lgfx::LGFX_Device {
+public:
+  lgfx::Bus_RGB _bus_instance;
+  lgfx::Panel_RGB _panel_instance;
+  lgfx::Light_PWM _light_instance;
+  lgfx::Touch_GT911 _touch_instance;
+  LGFX(void) {
+    { auto cfg = _bus_instance.config(); cfg.panel = &_panel_instance; 
+      cfg.pin_d0 = GPIO_NUM_14; cfg.pin_d1 = GPIO_NUM_38; cfg.pin_d2 = GPIO_NUM_18; cfg.pin_d3 = GPIO_NUM_17;
+      cfg.pin_d4 = GPIO_NUM_10; cfg.pin_d5 = GPIO_NUM_39; cfg.pin_d6 = GPIO_NUM_0; cfg.pin_d7 = GPIO_NUM_45;
+      cfg.pin_d8 = GPIO_NUM_48; cfg.pin_d9 = GPIO_NUM_47; cfg.pin_d10 = GPIO_NUM_21; cfg.pin_d11 = GPIO_NUM_1;
+      cfg.pin_d12 = GPIO_NUM_2; cfg.pin_d13 = GPIO_NUM_42; cfg.pin_d14 = GPIO_NUM_41; cfg.pin_d15 = GPIO_NUM_40;
+      cfg.pin_henable = GPIO_NUM_5; cfg.pin_vsync = GPIO_NUM_3; cfg.pin_hsync = GPIO_NUM_46; cfg.pin_pclk = GPIO_NUM_7;
+      cfg.freq_write = 14000000; cfg.hsync_polarity = 0; cfg.hsync_front_porch = 40; cfg.hsync_pulse_width = 48; cfg.hsync_back_porch = 40;
+      cfg.vsync_polarity = 0; cfg.vsync_front_porch = 13; cfg.vsync_pulse_width = 3; cfg.vsync_back_porch = 32;
+      cfg.pclk_active_neg = 1; cfg.de_idle_high = 0; cfg.pclk_idle_high = 0; _bus_instance.config(cfg); _panel_instance.setBus(&_bus_instance); }
+    { auto cfg = _panel_instance.config(); cfg.memory_width = 800; cfg.memory_height = 480; cfg.panel_width = 800; cfg.panel_height = 480; _panel_instance.config(cfg); }
+    { auto cfg = _light_instance.config(); cfg.pin_bl = GPIO_NUM_2; _light_instance.config(cfg); _panel_instance.setLight(&_light_instance); }
+    { auto cfg = _touch_instance.config(); cfg.x_min = 0; cfg.x_max = 799; cfg.y_min = 0; cfg.y_max = 479; cfg.pin_int = GPIO_NUM_4; cfg.pin_rst = -1; cfg.pin_sda = GPIO_NUM_8; cfg.pin_scl = GPIO_NUM_9; cfg.i2c_port = 0; cfg.freq = 400000; _touch_instance.config(cfg); _panel_instance.setTouch(&_touch_instance); }
+    setPanel(&_panel_instance);
+  }
+};
+LGFX tft;
+
+uint16_t COL_BG, COL_BTN_BLUE, COL_TEXT, COL_LOGO;
+
+void initColors() {
+  COL_BG = tft.color565(170, 170, 170);
+  COL_BTN_BLUE = tft.color565(40, 130, 200);
+  COL_TEXT = tft.color565(255, 255, 255);
+  COL_LOGO = tft.color565(10, 10, 10);
+}
+
+void afiseazaMesajCentral(String txt, uint16_t culoare) {
+  tft.fillRect(20, 240, SCR_W - 40, 80, COL_BG); 
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(culoare, COL_BG); 
+  tft.setFont(&fonts::Font4);
+  tft.setTextSize(1.3);
+  tft.drawString(txt, SCR_W / 2, 280);
+}
+
+void afiseazaDateSenzori() {
+  tft.fillRect(0, 140, SCR_W, 80, COL_BG);
+  tft.setTextDatum(MC_DATUM);
+  if (!dateSensibileVizibile) {
+    tft.setTextColor(tft.color565(120, 120, 120), COL_BG);
+    tft.setFont(&fonts::Font4);
+    tft.setTextSize(1.0);
+    tft.drawString("[ Date Protejate - Privacy Mode ]", SCR_W / 2, 180);
+    return;
+  }
+  tft.setTextColor(tft.color565(0, 100, 0), COL_BG);
+  tft.setFont(&fonts::Font4);
+  tft.setTextSize(1.5);
+  char buf[128];
+  snprintf(buf, sizeof(buf), "Puls: %.1f | SpO2: %.1f%% | Temp: %.1fC", lastPulse, lastSpO2, lastTemp);
+  tft.drawString(buf, SCR_W / 2, 180);
+}
+
+void drawButton(int i, bool selected) {
+  int btnW = (SCR_W - (BTN_GAP * (BTN_COUNT + 1))) / BTN_COUNT;
+  int x = BTN_GAP + i * (btnW + BTN_GAP);
+  uint16_t bg = (i == 0) ? tft.color565(180, 0, 0) : COL_BTN_BLUE;
+  tft.fillRoundRect(x, BTN_Y, btnW, BTN_H, 12, bg);
+  if (selected) {
+    tft.drawRoundRect(x, BTN_Y, btnW, BTN_H, 12, TFT_WHITE);
+    tft.drawRoundRect(x+1, BTN_Y+1, btnW-2, BTN_H-2, 11, TFT_WHITE);
+  }
+  tft.setTextColor(COL_TEXT, bg);
+  tft.setFont(&fonts::Font4);
+  tft.setTextSize(0.9);
+  tft.drawString(BTN_LABELS[i], x + btnW / 2, BTN_Y + BTN_H / 2 + 2);
+}
+
+void drawMainUI() {
+  tft.fillScreen(COL_BG);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(COL_LOGO); tft.setFont(&fonts::Font4); tft.setTextSize(2.5);
+  tft.drawString("MedBud", SCR_W / 2, 50);
+  afiseazaDateSenzori();
+  afiseazaMesajCentral(msgDeLaPi, tft.color565(0, 0, 150));
+  for (int i = 0; i < BTN_COUNT; i++) drawButton(i, activeBtn == i);
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  if (error) return;
+  JsonObject data = doc.containsKey("client") ? doc["client"] : (doc.containsKey("shared") ? doc["shared"] : doc.as<JsonObject>());
+  float nP = data.containsKey("pulse") ? data["pulse"].as<float>() : lastPulse;
+  float nO = data.containsKey("oxygen") ? data["oxygen"].as<float>() : lastSpO2;
+  float nT = data.containsKey("temperature") ? data["temperature"].as<float>() : lastTemp;
+
+  if (nP == lastPulse && nO == lastSpO2 && nT == lastTemp) {
+    dateSensibileVizibile = false;
+  } else {
+    lastPulse = nP; lastSpO2 = nO; lastTemp = nT;
+    dateSensibileVizibile = true;
+  }
+  if (data.containsKey("comanda")) {
+    String newMsg = data["comanda"].as<String>();
+    if (newMsg != lastReceivedPiMsg) {
+      msgDeLaPi = newMsg;
+      lastReceivedPiMsg = newMsg;
+      if(!inEasterEgg) afiseazaMesajCentral(msgDeLaPi, tft.color565(0, 0, 150));
+    }
+  }
+  if (!inEasterEgg) afiseazaDateSenzori();
+}
+
+void requestAttributes() {
+  requestId++;
+  String topic = "v1/devices/me/attributes/request/" + String(requestId);
+  String payload = "{\"clientKeys\":\"pulse,oxygen,temperature,comanda\", \"sharedKeys\":\"comanda\"}";
+  client.publish(topic.c_str(), payload.c_str());
+}
+
+void deseneazaRole(int r1, int r2, int r3) {
+  tft.fillRect(150, 150, 120, 150, TFT_WHITE);
+  tft.fillRect(340, 150, 120, 150, TFT_WHITE);
+  tft.fillRect(530, 150, 120, 150, TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setFont(&fonts::Font4);
+  tft.setTextSize(3);
+  tft.drawString(String(r1), 210, 225);
+  tft.drawString(String(r2), 400, 225);
+  tft.drawString(String(r3), 590, 225);
+}
+
+void initEasterEgg() {
+  tft.fillScreen(tft.color565(20, 20, 30));
+  tft.setTextColor(tft.color565(255, 215, 0)); 
+  tft.setFont(&fonts::Font4);
+  tft.setTextSize(2);
+  tft.drawString("PACANELE MEDICALE", SCR_W/2, 50);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(0.8);
+  tft.drawString("Tap pt a roti | Tine apasat 3 sec pt EXIT", SCR_W/2, 430);
+  deseneazaRole(7, 7, 7);
+}
+
+void joacaPacanele() {
+  int r1=0, r2=0, r3=0;
+  for(int i=0; i<12; i++) {
+    r1 = random(1, 8); r2 = random(1, 8); r3 = random(1, 8);
+    deseneazaRole(r1, r2, r3);
+    delay(50);
+  }
+  tft.fillRect(0, 320, SCR_W, 80, tft.color565(20, 20, 30)); 
+  tft.setTextSize(1.5);
+  if (r1 == r2 && r2 == r3) {
+    tft.setTextColor(TFT_GREEN, tft.color565(20, 20, 30));
+    tft.drawString("JACKPOT! SANATATE MAXIMA!", SCR_W/2, 350);
+  } else {
+    tft.setTextColor(TFT_RED, tft.color565(20, 20, 30));
+    tft.drawString("GHINION! MAI BAGA O FISA!", SCR_W/2, 350);
+  }
+}
+
+void loopEasterEgg() {
+  lgfx::touch_point_t tp;
+  bool isTouched = tft.getTouch(&tp);
+  if (waitForRelease) {
+    if (!isTouched) {
+      waitForRelease = false;
+      touching = false;
+    }
+    return; 
+  }
+  if (isTouched) {
+    if (!touching) {
+      touching = true;
+      btnPressStartTime = millis();
+      joacaPacanele(); 
+    } else {
+      if (millis() - btnPressStartTime > 3000) {
+        inEasterEgg = false;
+        touching = false;
+        drawMainUI();
+      }
+    }
+  } else {
+    touching = false;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setBrightness(200);
+  initColors();
+  pinMode(PIN_BUTON_PANICA, INPUT_PULLUP);
+  drawMainUI();
+  WiFi.begin(ssid, password);
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(onMqttMessage);
+  client.setBufferSize(1024);
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) {
+      if (now - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = now;
+        if (client.connect("Waveshare_MedBud", token, "")) {
+          client.subscribe("v1/devices/me/attributes/response/+");
+          client.subscribe("v1/devices/me/attributes"); 
+          requestAttributes();
+        }
+      }
+    } else {
+      client.loop();
+      if (now - lastPollTime > 10000) { 
+        lastPollTime = now; 
+        requestAttributes();
+      }
+    }
+  }
+
+  if (digitalRead(PIN_BUTON_PANICA) == LOW) {
+    delay(50); 
+    if (digitalRead(PIN_BUTON_PANICA) == LOW) {
+      if (activeBtn != 0) {
+        if (activeBtn != -1) drawButton(activeBtn, false);
+        activeBtn = 0; 
+        drawButton(0, true);
+        afiseazaMesajCentral(BTN_MESSAGES[0], tft.color565(200, 0, 0));
+      }
+      while(digitalRead(PIN_BUTON_PANICA) == LOW) { delay(10); }
+    }
+  }
+
+  if (inEasterEgg) {
+    loopEasterEgg();
+    return;
+  }
+
+  lgfx::touch_point_t tp;
+  if (tft.getTouch(&tp)) {
+    if (!touching) {
+      int btnW = (SCR_W - (BTN_GAP * (BTN_COUNT + 1))) / BTN_COUNT;
+      for (int i = 0; i < BTN_COUNT; i++) {
+        int x = BTN_GAP + i * (btnW + BTN_GAP);
+        if (tp.x >= x && tp.x <= x + btnW && tp.y >= BTN_Y && tp.y <= BTN_Y + BTN_H) {
+          if (activeBtn != -1) drawButton(activeBtn, false);
+          activeBtn = i;
+          drawButton(i, true);
+          uint16_t msgColor = (i == 0) ? tft.color565(200, 0, 0) : tft.color565(0, 0, 120);
+          afiseazaMesajCentral(BTN_MESSAGES[i], msgColor);
+          currentlyPressedBtn = i;
+          btnPressStartTime = millis();
+          break;
+        }
+      }
+      touching = true;
+    } else {
+      if (currentlyPressedBtn == 1) { 
+        if (millis() - btnPressStartTime >= 3000) {
+          inEasterEgg = true;
+          waitForRelease = true; 
+          initEasterEgg();
+          currentlyPressedBtn = -1;
+        }
+      }
+    }
+  } else {
+    touching = false;
+    currentlyPressedBtn = -1;
+  }
+  delay(10);
+}
